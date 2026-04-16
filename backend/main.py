@@ -1,0 +1,376 @@
+"""
+RouteRadar — AI-powered supply chain disruption predictor
+FastAPI backend: main.py
+"""
+
+import asyncio
+import json
+import os
+import pickle
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional
+
+import numpy as np
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+
+# ─── Config ────────────────────────────────────────────────────────────────────
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:postgres@localhost:5432/routeradar"
+)
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "route_model.pkl")
+
+# ─── Alternate routes (hardcoded per spec) ─────────────────────────────────────
+ALTERNATES = {
+    "MUM_DEL": [
+        {
+            "name": "Via Rajkot–Ahmedabad corridor",
+            "risk_score": 0.22,
+            "extra_time_minutes": 95,
+            "extra_distance_km": 210,
+        },
+        {
+            "name": "Via Surat–Vadodara bypass",
+            "risk_score": 0.31,
+            "extra_time_minutes": 60,
+            "extra_distance_km": 145,
+        },
+    ],
+    "DEL_KOL": [
+        {
+            "name": "Via Varanasi–Patna NH route",
+            "risk_score": 0.18,
+            "extra_time_minutes": 70,
+            "extra_distance_km": 130,
+        },
+        {
+            "name": "Via Lucknow–Gorakhpur corridor",
+            "risk_score": 0.29,
+            "extra_time_minutes": 45,
+            "extra_distance_km": 90,
+        },
+    ],
+    "MUM_CHE": [
+        {
+            "name": "Via Pune–Solapur highway",
+            "risk_score": 0.20,
+            "extra_time_minutes": 55,
+            "extra_distance_km": 120,
+        },
+        {
+            "name": "Via Goa coastal route",
+            "risk_score": 0.35,
+            "extra_time_minutes": 110,
+            "extra_distance_km": 185,
+        },
+    ],
+}
+
+# ─── Globals ────────────────────────────────────────────────────────────────────
+model = None
+sim_hour_offset = 0          # how many hours we've "advanced" past seeded data
+connected_clients: List[WebSocket] = []
+
+
+# ─── DB helpers ─────────────────────────────────────────────────────────────────
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+def predict_risk(features: dict) -> float:
+    """Run the loaded XGBoost model and return a probability."""
+    if model is None:
+        return 0.0
+    X = np.array([[
+        features["weather_severity"],
+        features["port_congestion_index"],
+        features["traffic_speed_ratio"],
+        1 if features["is_holiday"] else 0,
+        features["hour_of_day"],
+        features["day_of_week"],
+    ]], dtype=float)
+    prob = float(model.predict_proba(X)[0][1])
+    return round(prob, 4)
+
+
+def get_latest_snapshot(route_id: str) -> Optional[dict]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT * FROM route_snapshots
+                WHERE route_id = %s
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (route_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def update_risk_score(snapshot_id: int, risk_score: float):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE route_snapshots SET risk_score = %s WHERE id = %s",
+                (risk_score, snapshot_id)
+            )
+        conn.commit()
+
+
+# ─── WebSocket broadcast ─────────────────────────────────────────────────────────
+async def broadcast(message: dict):
+    dead = []
+    for ws in connected_clients:
+        try:
+            await ws.send_json(message)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        connected_clients.remove(ws)
+
+
+# ─── Alert loop ─────────────────────────────────────────────────────────────────
+async def alert_loop():
+    """Every 30s check all routes; push alert if risk > 0.7."""
+    from simulate_data import ROUTES
+    while True:
+        await asyncio.sleep(30)
+        try:
+            for route in ROUTES:
+                rid = route["route_id"]
+                snap = get_latest_snapshot(rid)
+                if not snap:
+                    continue
+                risk = predict_risk(snap)
+                if risk > 0.7:
+                    hours_ahead = max(1, round((1 - risk) * 20))
+                    confidence = round(risk * 90 + 5)
+                    msg = {
+                        "type": "alert",
+                        "route_id": rid,
+                        "route_name": route["name"],
+                        "risk_score": risk,
+                        "message": (
+                            f"High disruption risk on {route['name']} "
+                            f"in approximately {hours_ahead} hours. "
+                            f"Risk score: {risk:.2f}. Confidence: {confidence}%"
+                        ),
+                        "triggered_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    await broadcast(msg)
+                    # Persist alert
+                    with get_conn() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                INSERT INTO alerts (route_id, triggered_at, risk_score, message)
+                                VALUES (%s, %s, %s, %s)
+                            """, (rid, datetime.now(timezone.utc), risk, msg["message"]))
+                        conn.commit()
+        except Exception as e:
+            print(f"[alert_loop] error: {e}")
+
+
+# ─── Lifespan ────────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global model
+
+    # 1. Seed database
+    print("Seeding database...")
+    from simulate_data import seed_database
+    seed_database(DATABASE_URL)
+
+    # 2. Train model if not present, else load
+    if not os.path.exists(MODEL_PATH):
+        print("Training model...")
+        from train_model import train
+        train()
+
+    print("Loading model...")
+    with open(MODEL_PATH, "rb") as f:
+        model = pickle.load(f)
+    print("Model loaded.")
+
+    # 3. Pre-compute and store risk scores for all snapshots
+    from simulate_data import ROUTES
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for route in ROUTES:
+                cur.execute(
+                    "SELECT id, weather_severity, port_congestion_index, traffic_speed_ratio, is_holiday, hour_of_day, day_of_week FROM route_snapshots WHERE route_id = %s",
+                    (route["route_id"],)
+                )
+                rows = cur.fetchall()
+                for row in rows:
+                    risk = predict_risk(dict(row))
+                    cur.execute("UPDATE route_snapshots SET risk_score = %s WHERE id = %s", (risk, row["id"]))
+        conn.commit()
+
+    # 4. Start alert loop
+    asyncio.create_task(alert_loop())
+    print("RouteRadar backend ready.")
+
+    yield  # app runs here
+
+
+# ─── App ─────────────────────────────────────────────────────────────────────────
+app = FastAPI(title="RouteRadar", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ─── Endpoints ───────────────────────────────────────────────────────────────────
+
+@app.get("/routes")
+async def list_routes():
+    from simulate_data import ROUTES, ROUTE_GEOJSON
+    result = []
+    for route in ROUTES:
+        rid = route["route_id"]
+        snap = get_latest_snapshot(rid)
+        if snap:
+            risk = predict_risk(snap)
+            update_risk_score(snap["id"], risk)
+        else:
+            risk = 0.0
+        result.append({
+            "route_id": rid,
+            "name": route["name"],
+            "risk_score": risk,
+            "geojson": ROUTE_GEOJSON[rid],
+            "latest_snapshot": {
+                "weather_severity": snap["weather_severity"] if snap else 0,
+                "port_congestion_index": snap["port_congestion_index"] if snap else 0,
+                "traffic_speed_ratio": snap["traffic_speed_ratio"] if snap else 1,
+            } if snap else None
+        })
+    return result
+
+
+@app.get("/routes/{route_id}/history")
+async def route_history(route_id: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT timestamp, risk_score, weather_severity, port_congestion_index
+                FROM route_snapshots
+                WHERE route_id = %s
+                ORDER BY timestamp DESC
+                LIMIT 24
+            """, (route_id,))
+            rows = cur.fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+@app.get("/routes/{route_id}/alternates")
+async def route_alternates(route_id: str):
+    alts = ALTERNATES.get(route_id, [])
+    return {"route_id": route_id, "alternates": alts}
+
+
+@app.post("/simulate/advance")
+async def advance_simulation():
+    """Advance sim clock by 1 hour — insert a new snapshot for each route."""
+    global sim_hour_offset
+    sim_hour_offset += 1
+
+    from simulate_data import ROUTES, generate_snapshots
+    from datetime import timezone
+
+    # Generate the next simulated hour (we use sim_hour_offset to pick from 48h data)
+    base_time = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0) - timedelta(hours=24)
+    all_snaps = generate_snapshots(base_time)
+
+    hour_idx = (24 + sim_hour_offset - 1) % 48
+    new_snaps = [s for s in all_snaps if all_snaps.index(s) // len(ROUTES) == hour_idx]
+
+    # Fallback: get snapshots at the desired hour index
+    route_snaps = {}
+    for s in all_snaps:
+        ridx = all_snaps.index(s)
+        h = ridx // len(ROUTES)
+        if h == hour_idx:
+            route_snaps[s["route_id"]] = s
+
+    now = datetime.now(timezone.utc)
+    inserted = []
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for route in ROUTES:
+                rid = route["route_id"]
+                snap = route_snaps.get(rid)
+                if not snap:
+                    continue
+                risk = predict_risk(snap)
+                cur.execute("""
+                    INSERT INTO route_snapshots
+                    (route_id, timestamp, weather_severity, port_congestion_index,
+                     traffic_speed_ratio, is_holiday, hour_of_day, day_of_week,
+                     risk_score, is_disruption)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    rid, now,
+                    snap["weather_severity"], snap["port_congestion_index"],
+                    snap["traffic_speed_ratio"], snap["is_holiday"],
+                    snap["hour_of_day"], snap["day_of_week"],
+                    risk, snap["is_disruption"]
+                ))
+                inserted.append({
+                    "route_id": rid,
+                    "risk_score": risk,
+                    "weather_severity": snap["weather_severity"],
+                    "port_congestion_index": snap["port_congestion_index"],
+                    "is_disruption": snap["is_disruption"],
+                })
+
+                # Immediately send alert if risk > 0.7
+                if risk > 0.7:
+                    route_name = route["name"]
+                    hours_ahead = max(1, round((1 - risk) * 20))
+                    confidence = round(risk * 90 + 5)
+                    msg = {
+                        "type": "alert",
+                        "route_id": rid,
+                        "route_name": route_name,
+                        "risk_score": risk,
+                        "message": (
+                            f"High disruption risk on {route_name} "
+                            f"in approximately {hours_ahead} hours. "
+                            f"Risk score: {risk:.2f}. Confidence: {confidence}%"
+                        ),
+                        "triggered_at": now.isoformat(),
+                    }
+                    asyncio.create_task(broadcast(msg))
+                    cur.execute("""
+                        INSERT INTO alerts (route_id, triggered_at, risk_score, message)
+                        VALUES (%s, %s, %s, %s)
+                    """, (rid, now, risk, msg["message"]))
+
+        conn.commit()
+
+    return {
+        "advanced_to_hour": sim_hour_offset,
+        "hour_index_used": hour_idx,
+        "snapshots": inserted,
+    }
+
+
+@app.websocket("/ws/alerts")
+async def ws_alerts(websocket: WebSocket):
+    await websocket.accept()
+    connected_clients.append(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # keep alive
+    except WebSocketDisconnect:
+        if websocket in connected_clients:
+            connected_clients.remove(websocket)
