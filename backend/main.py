@@ -16,6 +16,7 @@ import numpy as np
 import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from gemini_service import generate_alert_message
 from fastapi.middleware.cors import CORSMiddleware
 
 # ─── Config ────────────────────────────────────────────────────────────────────
@@ -147,19 +148,15 @@ async def alert_loop():
                     continue
                 risk = predict_risk(snap)
                 if risk > 0.7:
-                    hours_ahead = max(1, round((1 - risk) * 20))
-                    confidence = round(risk * 90 + 5)
+                    alert_text = generate_alert_message(rid, snap, risk)
                     msg = {
                         "type": "alert",
                         "route_id": rid,
                         "route_name": route["name"],
                         "risk_score": risk,
-                        "message": (
-                            f"High disruption risk on {route['name']} "
-                            f"in approximately {hours_ahead} hours. "
-                            f"Risk score: {risk:.2f}. Confidence: {confidence}%"
-                        ),
+                        "message": alert_text,
                         "triggered_at": datetime.now(timezone.utc).isoformat(),
+                        "ai_generated": True,
                     }
                     await broadcast(msg)
                     # Persist alert
@@ -334,20 +331,15 @@ async def advance_simulation():
 
                 # Immediately send alert if risk > 0.7
                 if risk > 0.7:
-                    route_name = route["name"]
-                    hours_ahead = max(1, round((1 - risk) * 20))
-                    confidence = round(risk * 90 + 5)
+                    alert_text = generate_alert_message(rid, snap, risk)
                     msg = {
                         "type": "alert",
                         "route_id": rid,
-                        "route_name": route_name,
+                        "route_name": route["name"],
                         "risk_score": risk,
-                        "message": (
-                            f"High disruption risk on {route_name} "
-                            f"in approximately {hours_ahead} hours. "
-                            f"Risk score: {risk:.2f}. Confidence: {confidence}%"
-                        ),
+                        "message": alert_text,
                         "triggered_at": now.isoformat(),
+                        "ai_generated": True,
                     }
                     asyncio.create_task(broadcast(msg))
                     cur.execute("""
@@ -363,6 +355,68 @@ async def advance_simulation():
         "snapshots": inserted,
     }
 
+
+
+@app.get("/impact")
+async def get_impact():
+    """Return impact metrics: CO2 saved, cost savings, disruptions caught."""
+    from simulate_data import ROUTES, ROUTE_CONTEXT
+
+    # Constants for impact calculation
+    CO2_PER_KM_TRUCK = 0.9          # kg CO2 per km (avg Indian heavy truck)
+    COST_PER_KM_INR = 45            # INR per km logistics cost
+    DISRUPTION_DELAY_HOURS = 6      # avg hours lost per unmitigated disruption
+    HOURLY_CARGO_VALUE_INR = 85000  # avg cargo value per hour of delay
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Total disruptions detected
+            cur.execute("SELECT COUNT(*) as cnt FROM alerts WHERE risk_score > 0.7")
+            disruptions_caught = cur.fetchone()["cnt"]
+
+            # Per route stats
+            route_stats = []
+            for route in ROUTES:
+                rid = route["route_id"]
+                ctx = ROUTE_CONTEXT.get(rid, {})
+                dist = ctx.get("distance_km", 1300)
+
+                # Alt route is ~15% longer on average
+                alt_dist_saved = dist * 0.15
+                co2_saved = round(alt_dist_saved * CO2_PER_KM_TRUCK, 1)
+                cost_saved = round(alt_dist_saved * COST_PER_KM_INR)
+
+                cur.execute(
+                    "SELECT COUNT(*) as cnt FROM alerts WHERE route_id=%s AND risk_score > 0.7",
+                    (rid,)
+                )
+                route_disruptions = cur.fetchone()["cnt"]
+
+                route_stats.append({
+                    "route_id": rid,
+                    "name": route["name"],
+                    "disruptions_caught": route_disruptions,
+                    "co2_saved_kg": co2_saved * route_disruptions if route_disruptions else 0,
+                    "cost_saved_inr": cost_saved * route_disruptions if route_disruptions else 0,
+                })
+
+    total_co2 = sum(r["co2_saved_kg"] for r in route_stats)
+    total_cost = sum(r["cost_saved_inr"] for r in route_stats)
+    delay_hours_avoided = disruptions_caught * DISRUPTION_DELAY_HOURS
+    cargo_value_protected = disruptions_caught * DISRUPTION_DELAY_HOURS * HOURLY_CARGO_VALUE_INR
+
+    return {
+        "summary": {
+            "disruptions_caught": disruptions_caught,
+            "co2_saved_kg": round(total_co2, 1),
+            "co2_saved_trees_equivalent": round(total_co2 / 21, 1),  # avg tree absorbs 21kg/yr
+            "cost_saved_inr": total_cost,
+            "delay_hours_avoided": delay_hours_avoided,
+            "cargo_value_protected_inr": cargo_value_protected,
+            "sdg_goals": ["SDG 9: Industry & Infrastructure", "SDG 13: Climate Action"],
+        },
+        "by_route": route_stats,
+    }
 
 @app.websocket("/ws/alerts")
 async def ws_alerts(websocket: WebSocket):
