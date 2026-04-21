@@ -57,6 +57,24 @@ ROUTE_GEOJSON = {
     }
 }
 
+ROUTE_CONTEXT = {
+    "MUM_DEL": {
+        "full_name": "Mumbai to Delhi",
+        "highway": "NH48",
+        "distance_km": 1400,
+    },
+    "DEL_KOL": {
+        "full_name": "Delhi to Kolkata",
+        "highway": "NH19",
+        "distance_km": 1500,
+    },
+    "MUM_CHE": {
+        "full_name": "Mumbai to Chennai",
+        "highway": "NH48",
+        "distance_km": 1300,
+    },
+}
+
 
 def generate_snapshots(base_time: datetime) -> List[Dict]:
     snapshots = []
