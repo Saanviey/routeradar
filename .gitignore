@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Python
 __pycache__/
 *.pyc
@@ -12,3 +13,10 @@ build/
 
 # Env
 .env
+=======
+node_modules/
+venv/
+__pycache__/
+.env
+.DS_Store
+>>>>>>> 0d9abf6320025a1c8574c8fdd000e6a9061ab854
