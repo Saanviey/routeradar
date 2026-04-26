@@ -1,5 +1,8 @@
 node_modules/
-venv/
+frontend/node_modules/
 __pycache__/
+*.pyc
+*.pkl
 .env
+build/
 .DS_Store
