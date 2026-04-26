@@ -1,8 +1,9 @@
 node_modules/
 frontend/node_modules/
-__pycache__/
+backend/__pycache__/
 *.pyc
 *.pkl
 .env
 build/
 .DS_Store
+*.log
