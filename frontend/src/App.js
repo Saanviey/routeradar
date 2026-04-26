@@ -40,6 +40,7 @@ export default function App() {
   const [advancing, setAdvancing] = useState(false);
   const [simHour, setSimHour] = useState(0);
   const [wsStatus, setWsStatus] = useState('connecting');
+  const [mapKey, setMapKey] = useState(0);
   const [riskFilter, setRiskFilter] = useState(0);
   const [alertFilter, setAlertFilter] = useState('all');
   const [compareMode, setCompareMode] = useState(false);
@@ -58,13 +59,26 @@ export default function App() {
       const res = await fetch(`${API}/routes`);
       const data = await res.json();
       setRoutes(data);
+      // Only update risk_score + snapshot, not full object, to avoid re-render cascade
       if (selectedRoute) {
         const updated = data.find(r => r.route_id === selectedRoute.route_id);
-        if (updated) setSelectedRoute(prev => ({ ...prev, ...updated }));
+        if (updated && updated.risk_score !== selectedRoute.risk_score) {
+          setSelectedRoute(prev => ({
+            ...prev,
+            risk_score: updated.risk_score,
+            latest_snapshot: updated.latest_snapshot,
+          }));
+        }
       }
       if (compareRoute) {
         const updated = data.find(r => r.route_id === compareRoute.route_id);
-        if (updated) setCompareRoute(prev => ({ ...prev, ...updated }));
+        if (updated && updated.risk_score !== compareRoute.risk_score) {
+          setCompareRoute(prev => ({
+            ...prev,
+            risk_score: updated.risk_score,
+            latest_snapshot: updated.latest_snapshot,
+          }));
+        }
       }
     } catch (e) { console.error('Failed to fetch routes', e); }
   }, [selectedRoute, compareRoute]);
@@ -95,6 +109,31 @@ export default function App() {
     connect();
     return () => wsRef.current?.close();
   }, [pushToast]);
+
+  const handleReset = async () => {
+    setAdvancing(true);
+    try {
+      await fetch(`${API}/simulate/reset`, { method: 'POST' });
+      setSimHour(0);
+      setAlerts([]);
+      setRoutes([]);
+      setMapKey(k => k + 1);
+      await fetchRoutes();
+      pushToast('✓ Simulation reset to normal', 'ok');
+    } catch (e) { console.error('Reset failed', e); }
+    finally { setAdvancing(false); }
+  };
+
+  const handleTriggerDisruption = async () => {
+    setAdvancing(true);
+    try {
+      await fetch(`${API}/simulate/trigger-disruption`, { method: 'POST' });
+      setSimHour(30);
+      await fetchRoutes();
+      pushToast('⚠ Disruption injected on Mumbai→Delhi', 'alert');
+    } catch (e) { console.error('Trigger failed', e); }
+    finally { setAdvancing(false); }
+  };
 
   const handleAdvance = async () => {
     setAdvancing(true);
@@ -172,7 +211,21 @@ export default function App() {
           <span className="sim-clock">T+{simHour}h</span>
         </div>
 
-        <div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            className="reset-btn"
+            onClick={handleReset}
+            disabled={advancing}
+          >
+            ↺ RESET
+          </button>
+          <button
+            className="trigger-btn"
+            onClick={handleTriggerDisruption}
+            disabled={advancing}
+          >
+            ⚡ TRIGGER DISRUPTION
+          </button>
           <button
             className={`advance-btn ${advancing ? 'loading' : ''}`}
             onClick={handleAdvance}
@@ -196,6 +249,7 @@ export default function App() {
       <div className="main">
         <div className="map-container">
           <MapView
+            key={mapKey}
             routes={filteredRoutes}
             allRoutes={routes}
             onRouteClick={handleRouteClick}
