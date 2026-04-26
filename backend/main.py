@@ -105,7 +105,7 @@ def get_latest_snapshot(route_id: str) -> Optional[dict]:
             cur.execute("""
                 SELECT * FROM route_snapshots
                 WHERE route_id = %s
-                ORDER BY timestamp DESC
+                ORDER BY id DESC
                 LIMIT 1
             """, (route_id,))
             row = cur.fetchone()
@@ -283,19 +283,19 @@ async def advance_simulation():
     from simulate_data import ROUTES, generate_snapshots
     from datetime import timezone
 
-    # Generate the next simulated hour (we use sim_hour_offset to pick from 48h data)
-    base_time = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0) - timedelta(hours=24)
+    # Generate full 48h dataset. Snapshots are ordered:
+    # hour0_route0, hour0_route1, hour0_route2, hour1_route0, ...
+    # So hour N = indices N*3 .. N*3+2
+    # The hardcoded disruption is at hour index 30 in simulate_data.py
+    base_time = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     all_snaps = generate_snapshots(base_time)
 
-    hour_idx = (24 + sim_hour_offset - 1) % 48
-    new_snaps = [s for s in all_snaps if all_snaps.index(s) // len(ROUTES) == hour_idx]
+    n_routes = len(ROUTES)
+    hour_idx = min(sim_hour_offset, 47)  # advance 30 times -> hour_idx = 30 -> hits disruption
 
-    # Fallback: get snapshots at the desired hour index
     route_snaps = {}
-    for s in all_snaps:
-        ridx = all_snaps.index(s)
-        h = ridx // len(ROUTES)
-        if h == hour_idx:
+    for i, s in enumerate(all_snaps):
+        if i // n_routes == hour_idx:
             route_snaps[s["route_id"]] = s
 
     now = datetime.now(timezone.utc)
@@ -417,6 +417,115 @@ async def get_impact():
         },
         "by_route": route_stats,
     }
+
+
+
+@app.post("/simulate/reset")
+async def reset_simulation():
+    """Re-seed the DB back to normal starting state."""
+    global sim_hour_offset
+    sim_hour_offset = 0
+    from simulate_data import seed_database
+    seed_database(DATABASE_URL)
+    # Re-compute risk scores
+    from simulate_data import ROUTES
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for route in ROUTES:
+                cur.execute(
+                    "SELECT id, weather_severity, port_congestion_index, traffic_speed_ratio, is_holiday, hour_of_day, day_of_week FROM route_snapshots WHERE route_id = %s",
+                    (route["route_id"],)
+                )
+                rows = cur.fetchall()
+                for row in rows:
+                    risk = predict_risk(dict(row))
+                    cur.execute("UPDATE route_snapshots SET risk_score = %s WHERE id = %s", (risk, row["id"]))
+        conn.commit()
+    return {"status": "reset complete", "sim_hour": 0}
+
+@app.post("/simulate/trigger-disruption")
+async def trigger_disruption():
+    """Directly inject the hour-30 disruption snapshot for demo purposes."""
+    global sim_hour_offset
+    sim_hour_offset = 30
+
+    from simulate_data import ROUTES
+    from datetime import timezone
+
+    # Hardcode the exact disruption values instead of relying on index math
+    disruption_snaps = {
+        "MUM_DEL": {
+            "weather_severity": 8.5,
+            "port_congestion_index": 9.0,
+            "traffic_speed_ratio": 0.25,
+            "is_holiday": False,
+            "hour_of_day": 6,
+            "day_of_week": 2,
+            "is_disruption": True,
+        },
+        "DEL_KOL": {
+            "weather_severity": 1.8,
+            "port_congestion_index": 3.2,
+            "traffic_speed_ratio": 0.82,
+            "is_holiday": False,
+            "hour_of_day": 6,
+            "day_of_week": 2,
+            "is_disruption": False,
+        },
+        "MUM_CHE": {
+            "weather_severity": 2.1,
+            "port_congestion_index": 2.8,
+            "traffic_speed_ratio": 0.78,
+            "is_holiday": False,
+            "hour_of_day": 6,
+            "day_of_week": 2,
+            "is_disruption": False,
+        },
+    }
+
+    now = datetime.now(timezone.utc)
+    inserted = []
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for route in ROUTES:
+                rid = route["route_id"]
+                snap = disruption_snaps[rid]
+                risk = predict_risk(snap)
+                cur.execute("""
+                    INSERT INTO route_snapshots
+                    (route_id, timestamp, weather_severity, port_congestion_index,
+                     traffic_speed_ratio, is_holiday, hour_of_day, day_of_week,
+                     risk_score, is_disruption)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    rid, now,
+                    snap["weather_severity"], snap["port_congestion_index"],
+                    snap["traffic_speed_ratio"], snap["is_holiday"],
+                    snap["hour_of_day"], snap["day_of_week"],
+                    risk, snap["is_disruption"]
+                ))
+                inserted.append({"route_id": rid, "risk_score": risk})
+
+                if risk > 0.7:
+                    alert_text = generate_alert_message(rid, snap, risk)
+                    msg = {
+                        "type": "alert",
+                        "route_id": rid,
+                        "route_name": route["name"],
+                        "risk_score": risk,
+                        "message": alert_text,
+                        "triggered_at": now.isoformat(),
+                        "ai_generated": True,
+                    }
+                    asyncio.create_task(broadcast(msg))
+                    cur.execute("""
+                        INSERT INTO alerts (route_id, triggered_at, risk_score, message)
+                        VALUES (%s, %s, %s, %s)
+                    """, (rid, now, risk, msg["message"]))
+
+        conn.commit()
+
+    return {"status": "disruption injected", "snapshots": inserted}
 
 @app.websocket("/ws/alerts")
 async def ws_alerts(websocket: WebSocket):

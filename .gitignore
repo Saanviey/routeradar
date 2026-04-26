@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Build/cache
+.cache/
+dist/
+build/
+
+# Env
+.env
+node_modules/
+frontend/node_modules/
+backend/__pycache__/
+*.pyc
+*.pkl
+.env
+build/
+.DS_Store
+*.log
+.DS_Store
+main
