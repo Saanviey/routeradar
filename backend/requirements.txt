@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 psycopg2-binary==2.9.9
@@ -6,3 +7,15 @@ numpy==1.26.4
 scikit-learn==1.4.2
 python-multipart==0.0.9
 python-dotenv==1.0.0
+=======
+fastapi
+uvicorn
+pandas
+numpy
+xgboost
+scikit-learn
+python-dotenv
+groq
+sqlalchemy
+psycopg2-binary
+>>>>>>> 5bd218de02162bb0eccb116018ba7b9dab0a7efd

@@ -19,13 +19,18 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from gemini_service import generate_alert_message
 from fastapi.middleware.cors import CORSMiddleware
 
-# ─── Config ────────────────────────────────────────────────────────────────────
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/routeradar"
-)
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "route_model.pkl")
+import os
+from dotenv import load_dotenv
 
+load_dotenv()
+
+print("STARTING MAIN.PY")
+
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+print("DATABASE_URL =", DATABASE_URL if DATABASE_URL else "NOT SET")
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "route_model.pkl")
 # ─── Alternate routes (hardcoded per spec) ─────────────────────────────────────
 ALTERNATES = {
     "MUM_DEL": [
@@ -179,7 +184,13 @@ async def lifespan(app: FastAPI):
     # 1. Seed database
     print("Seeding database...")
     from simulate_data import seed_database
-    seed_database(DATABASE_URL)
+    try:
+        if DATABASE_URL and "localhost" not in DATABASE_URL:
+          seed_database(DATABASE_URL)
+        else:
+         print("Skipping DB seed on startup")
+    except Exception as e:
+       print("DB startup skipped:", e)
 
     # 2. Train model if not present, else load
     if not os.path.exists(MODEL_PATH):
@@ -419,14 +430,23 @@ async def get_impact():
     }
 
 
-
 @app.post("/simulate/reset")
 async def reset_simulation():
     """Re-seed the DB back to normal starting state."""
     global sim_hour_offset
     sim_hour_offset = 0
+
     from simulate_data import seed_database
-    seed_database(DATABASE_URL)
+
+    try:
+        if DATABASE_URL and "localhost" not in DATABASE_URL:
+            seed_database(DATABASE_URL)
+        else:
+            print("Skipping DB seed")
+    except Exception as e:
+        print("DB startup skipped:", e)
+
+    return {"message": "Simulation reset complete"}
     # Re-compute risk scores
     from simulate_data import ROUTES
     with get_conn() as conn:
