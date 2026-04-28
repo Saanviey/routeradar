@@ -19,10 +19,18 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from gemini_service import generate_alert_message
 from fastapi.middleware.cors import CORSMiddleware
 
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+print("STARTING MAIN.PY")
+print("DATABASE_URL =", os.getenv("DATABASE_URL"))
+
 # ─── Config ────────────────────────────────────────────────────────────────────
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/routeradar"
+    "postgresql://postgres:Post#adi@localhost:5432/routeradar"
 )
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "route_model.pkl")
 
@@ -426,7 +434,8 @@ async def reset_simulation():
     global sim_hour_offset
     sim_hour_offset = 0
     from simulate_data import seed_database
-    seed_database(DATABASE_URL)
+    if DATABASE_URL:
+       seed_database(DATABASE_URL)
     # Re-compute risk scores
     from simulate_data import ROUTES
     with get_conn() as conn:
