@@ -7,30 +7,46 @@ import asyncio
 import json
 import os
 import pickle
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 import numpy as np
-import psycopg2
-import psycopg2.extras
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from gemini_service import generate_alert_message
 from fastapi.middleware.cors import CORSMiddleware
-
-import os
 from dotenv import load_dotenv
+
+# Try to import PostgreSQL libraries, but fallback gracefully
+try:
+    import psycopg2
+    import psycopg2.extras
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    POSTGRES_AVAILABLE = False
+    print("PostgreSQL not available, using SQLite")
+
+from gemini_service import generate_alert_message
 
 load_dotenv()
 
 print("STARTING MAIN.PY")
 
+# Database configuration - use SQLite for Hugging Face
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-print("DATABASE_URL =", DATABASE_URL if DATABASE_URL else "NOT SET")
+# If no PostgreSQL URL, use SQLite
+if not DATABASE_URL or "localhost" in DATABASE_URL:
+    DATABASE_URL = "sqlite:///./routeradar.db"
+    USE_SQLITE = True
+    print("Using SQLite database")
+else:
+    USE_SQLITE = False
+    print("Using PostgreSQL database")
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "route_model.pkl")
+
 # ─── Alternate routes (hardcoded per spec) ─────────────────────────────────────
 ALTERNATES = {
     "MUM_DEL": [
@@ -79,13 +95,60 @@ ALTERNATES = {
 
 # ─── Globals ────────────────────────────────────────────────────────────────────
 model = None
-sim_hour_offset = 0          # how many hours we've "advanced" past seeded data
+sim_hour_offset = 0
 connected_clients: List[WebSocket] = []
 
 
 # ─── DB helpers ─────────────────────────────────────────────────────────────────
 def get_conn():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    """Get database connection - works with both PostgreSQL and SQLite"""
+    if USE_SQLITE or not POSTGRES_AVAILABLE:
+        # SQLite connection
+        conn = sqlite3.connect('routeradar.db')
+        conn.row_factory = sqlite3.Row
+        return conn
+    else:
+        # PostgreSQL connection
+        return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+def init_sqlite_db():
+    """Initialize SQLite database tables if they don't exist"""
+    if USE_SQLITE or not POSTGRES_AVAILABLE:
+        conn = sqlite3.connect('routeradar.db')
+        cursor = conn.cursor()
+        
+        # Create route_snapshots table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS route_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                route_id TEXT NOT NULL,
+                timestamp TIMESTAMP NOT NULL,
+                weather_severity REAL,
+                port_congestion_index REAL,
+                traffic_speed_ratio REAL,
+                is_holiday BOOLEAN,
+                hour_of_day INTEGER,
+                day_of_week INTEGER,
+                risk_score REAL,
+                is_disruption BOOLEAN
+            )
+        ''')
+        
+        # Create alerts table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                route_id TEXT NOT NULL,
+                triggered_at TIMESTAMP NOT NULL,
+                risk_score REAL,
+                message TEXT
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        print("SQLite database initialized")
 
 
 def predict_risk(features: dict) -> float:
@@ -106,21 +169,35 @@ def predict_risk(features: dict) -> float:
 
 def get_latest_snapshot(route_id: str) -> Optional[dict]:
     with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
+        cursor = conn.cursor()
+        if USE_SQLITE or not POSTGRES_AVAILABLE:
+            cursor.execute("""
+                SELECT * FROM route_snapshots
+                WHERE route_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+            """, (route_id,))
+        else:
+            cursor.execute("""
                 SELECT * FROM route_snapshots
                 WHERE route_id = %s
                 ORDER BY id DESC
                 LIMIT 1
             """, (route_id,))
-            row = cur.fetchone()
-            return dict(row) if row else None
+        row = cursor.fetchone()
+        return dict(row) if row else None
 
 
 def update_risk_score(snapshot_id: int, risk_score: float):
     with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
+        cursor = conn.cursor()
+        if USE_SQLITE or not POSTGRES_AVAILABLE:
+            cursor.execute(
+                "UPDATE route_snapshots SET risk_score = ? WHERE id = ?",
+                (risk_score, snapshot_id)
+            )
+        else:
+            cursor.execute(
                 "UPDATE route_snapshots SET risk_score = %s WHERE id = %s",
                 (risk_score, snapshot_id)
             )
@@ -142,7 +219,12 @@ async def broadcast(message: dict):
 # ─── Alert loop ─────────────────────────────────────────────────────────────────
 async def alert_loop():
     """Every 30s check all routes; push alert if risk > 0.7."""
-    from simulate_data import ROUTES
+    try:
+        from simulate_data import ROUTES
+    except ImportError:
+        print("simulate_data not available")
+        return
+    
     while True:
         await asyncio.sleep(30)
         try:
@@ -166,8 +248,14 @@ async def alert_loop():
                     await broadcast(msg)
                     # Persist alert
                     with get_conn() as conn:
-                        with conn.cursor() as cur:
-                            cur.execute("""
+                        cursor = conn.cursor()
+                        if USE_SQLITE or not POSTGRES_AVAILABLE:
+                            cursor.execute("""
+                                INSERT INTO alerts (route_id, triggered_at, risk_score, message)
+                                VALUES (?, ?, ?, ?)
+                            """, (rid, datetime.now(timezone.utc), risk, msg["message"]))
+                        else:
+                            cursor.execute("""
                                 INSERT INTO alerts (route_id, triggered_at, risk_score, message)
                                 VALUES (%s, %s, %s, %s)
                             """, (rid, datetime.now(timezone.utc), risk, msg["message"]))
@@ -181,42 +269,64 @@ async def alert_loop():
 async def lifespan(app: FastAPI):
     global model
 
+    # Initialize SQLite database
+    init_sqlite_db()
+
     # 1. Seed database
     print("Seeding database...")
-    from simulate_data import seed_database
     try:
-        if DATABASE_URL and "localhost" not in DATABASE_URL:
-          seed_database(DATABASE_URL)
+        from simulate_data import seed_database
+        if not USE_SQLITE:
+            seed_database(DATABASE_URL)
         else:
-         print("Skipping DB seed on startup")
+            print("Using SQLite - seeding may be handled by simulate_data")
     except Exception as e:
-       print("DB startup skipped:", e)
+        print(f"DB startup skipped or failed: {e}")
 
     # 2. Train model if not present, else load
     if not os.path.exists(MODEL_PATH):
         print("Training model...")
-        from train_model import train
-        train()
+        try:
+            from train_model import train
+            train()
+        except Exception as e:
+            print(f"Model training failed: {e}")
 
     print("Loading model...")
-    with open(MODEL_PATH, "rb") as f:
-        model = pickle.load(f)
-    print("Model loaded.")
+    try:
+        with open(MODEL_PATH, "rb") as f:
+            model = pickle.load(f)
+        print("Model loaded.")
+    except Exception as e:
+        print(f"Model loading failed: {e}")
+        model = None
 
     # 3. Pre-compute and store risk scores for all snapshots
-    from simulate_data import ROUTES
-    with get_conn() as conn:
-        with conn.cursor() as cur:
+    try:
+        from simulate_data import ROUTES
+        with get_conn() as conn:
+            cursor = conn.cursor()
             for route in ROUTES:
-                cur.execute(
-                    "SELECT id, weather_severity, port_congestion_index, traffic_speed_ratio, is_holiday, hour_of_day, day_of_week FROM route_snapshots WHERE route_id = %s",
-                    (route["route_id"],)
-                )
-                rows = cur.fetchall()
+                if USE_SQLITE or not POSTGRES_AVAILABLE:
+                    cursor.execute(
+                        "SELECT id, weather_severity, port_congestion_index, traffic_speed_ratio, is_holiday, hour_of_day, day_of_week FROM route_snapshots WHERE route_id = ?",
+                        (route["route_id"],)
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT id, weather_severity, port_congestion_index, traffic_speed_ratio, is_holiday, hour_of_day, day_of_week FROM route_snapshots WHERE route_id = %s",
+                        (route["route_id"],)
+                    )
+                rows = cursor.fetchall()
                 for row in rows:
                     risk = predict_risk(dict(row))
-                    cur.execute("UPDATE route_snapshots SET risk_score = %s WHERE id = %s", (risk, row["id"]))
-        conn.commit()
+                    if USE_SQLITE or not POSTGRES_AVAILABLE:
+                        cursor.execute("UPDATE route_snapshots SET risk_score = ? WHERE id = ?", (risk, row["id"]))
+                    else:
+                        cursor.execute("UPDATE route_snapshots SET risk_score = %s WHERE id = %s", (risk, row["id"]))
+            conn.commit()
+    except Exception as e:
+        print(f"Risk score precomputation failed: {e}")
 
     # 4. Start alert loop
     asyncio.create_task(alert_loop())
@@ -236,11 +346,36 @@ app.add_middleware(
 )
 
 
-# ─── Endpoints ───────────────────────────────────────────────────────────────────
+# ─── Health Check Endpoint ──────────────────────────────────────────────────────
+@app.get("/")
+async def root():
+    return {
+        "status": "healthy",
+        "service": "RouteRadar API",
+        "version": "1.0.0",
+        "database": "SQLite" if USE_SQLITE else "PostgreSQL",
+        "model_loaded": model is not None,
+        "endpoints": [
+            "/routes",
+            "/routes/{id}/history",
+            "/routes/{id}/alternates",
+            "/simulate/advance",
+            "/simulate/reset",
+            "/simulate/trigger-disruption",
+            "/impact",
+            "/ws/alerts"
+        ]
+    }
 
+
+# ─── Endpoints ───────────────────────────────────────────────────────────────────
 @app.get("/routes")
 async def list_routes():
-    from simulate_data import ROUTES, ROUTE_GEOJSON
+    try:
+        from simulate_data import ROUTES, ROUTE_GEOJSON
+    except ImportError:
+        return {"error": "simulate_data module not available"}
+    
     result = []
     for route in ROUTES:
         rid = route["route_id"]
@@ -254,7 +389,7 @@ async def list_routes():
             "route_id": rid,
             "name": route["name"],
             "risk_score": risk,
-            "geojson": ROUTE_GEOJSON[rid],
+            "geojson": ROUTE_GEOJSON.get(rid, {}),
             "latest_snapshot": {
                 "weather_severity": snap["weather_severity"] if snap else 0,
                 "port_congestion_index": snap["port_congestion_index"] if snap else 0,
@@ -267,15 +402,24 @@ async def list_routes():
 @app.get("/routes/{route_id}/history")
 async def route_history(route_id: str):
     with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
+        cursor = conn.cursor()
+        if USE_SQLITE or not POSTGRES_AVAILABLE:
+            cursor.execute("""
+                SELECT timestamp, risk_score, weather_severity, port_congestion_index
+                FROM route_snapshots
+                WHERE route_id = ?
+                ORDER BY timestamp DESC
+                LIMIT 24
+            """, (route_id,))
+        else:
+            cursor.execute("""
                 SELECT timestamp, risk_score, weather_severity, port_congestion_index
                 FROM route_snapshots
                 WHERE route_id = %s
                 ORDER BY timestamp DESC
                 LIMIT 24
             """, (route_id,))
-            rows = cur.fetchall()
+        rows = cursor.fetchall()
     return [dict(r) for r in reversed(rows)]
 
 
@@ -291,18 +435,16 @@ async def advance_simulation():
     global sim_hour_offset
     sim_hour_offset += 1
 
-    from simulate_data import ROUTES, generate_snapshots
-    from datetime import timezone
+    try:
+        from simulate_data import ROUTES, generate_snapshots
+    except ImportError:
+        return {"error": "simulate_data module not available"}
 
-    # Generate full 48h dataset. Snapshots are ordered:
-    # hour0_route0, hour0_route1, hour0_route2, hour1_route0, ...
-    # So hour N = indices N*3 .. N*3+2
-    # The hardcoded disruption is at hour index 30 in simulate_data.py
     base_time = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     all_snaps = generate_snapshots(base_time)
 
     n_routes = len(ROUTES)
-    hour_idx = min(sim_hour_offset, 47)  # advance 30 times -> hour_idx = 30 -> hits disruption
+    hour_idx = min(sim_hour_offset, 47)
 
     route_snaps = {}
     for i, s in enumerate(all_snaps):
@@ -312,14 +454,30 @@ async def advance_simulation():
     now = datetime.now(timezone.utc)
     inserted = []
     with get_conn() as conn:
-        with conn.cursor() as cur:
-            for route in ROUTES:
-                rid = route["route_id"]
-                snap = route_snaps.get(rid)
-                if not snap:
-                    continue
-                risk = predict_risk(snap)
-                cur.execute("""
+        cursor = conn.cursor()
+        for route in ROUTES:
+            rid = route["route_id"]
+            snap = route_snaps.get(rid)
+            if not snap:
+                continue
+            risk = predict_risk(snap)
+            
+            if USE_SQLITE or not POSTGRES_AVAILABLE:
+                cursor.execute("""
+                    INSERT INTO route_snapshots
+                    (route_id, timestamp, weather_severity, port_congestion_index,
+                     traffic_speed_ratio, is_holiday, hour_of_day, day_of_week,
+                     risk_score, is_disruption)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    rid, now,
+                    snap["weather_severity"], snap["port_congestion_index"],
+                    snap["traffic_speed_ratio"], snap["is_holiday"],
+                    snap["hour_of_day"], snap["day_of_week"],
+                    risk, snap["is_disruption"]
+                ))
+            else:
+                cursor.execute("""
                     INSERT INTO route_snapshots
                     (route_id, timestamp, weather_severity, port_congestion_index,
                      traffic_speed_ratio, is_holiday, hour_of_day, day_of_week,
@@ -332,28 +490,36 @@ async def advance_simulation():
                     snap["hour_of_day"], snap["day_of_week"],
                     risk, snap["is_disruption"]
                 ))
-                inserted.append({
-                    "route_id": rid,
-                    "risk_score": risk,
-                    "weather_severity": snap["weather_severity"],
-                    "port_congestion_index": snap["port_congestion_index"],
-                    "is_disruption": snap["is_disruption"],
-                })
+            
+            inserted.append({
+                "route_id": rid,
+                "risk_score": risk,
+                "weather_severity": snap["weather_severity"],
+                "port_congestion_index": snap["port_congestion_index"],
+                "is_disruption": snap["is_disruption"],
+            })
 
-                # Immediately send alert if risk > 0.7
-                if risk > 0.7:
-                    alert_text = generate_alert_message(rid, snap, risk)
-                    msg = {
-                        "type": "alert",
-                        "route_id": rid,
-                        "route_name": route["name"],
-                        "risk_score": risk,
-                        "message": alert_text,
-                        "triggered_at": now.isoformat(),
-                        "ai_generated": True,
-                    }
-                    asyncio.create_task(broadcast(msg))
-                    cur.execute("""
+            # Immediately send alert if risk > 0.7
+            if risk > 0.7:
+                alert_text = generate_alert_message(rid, snap, risk)
+                msg = {
+                    "type": "alert",
+                    "route_id": rid,
+                    "route_name": route["name"],
+                    "risk_score": risk,
+                    "message": alert_text,
+                    "triggered_at": now.isoformat(),
+                    "ai_generated": True,
+                }
+                asyncio.create_task(broadcast(msg))
+                
+                if USE_SQLITE or not POSTGRES_AVAILABLE:
+                    cursor.execute("""
+                        INSERT INTO alerts (route_id, triggered_at, risk_score, message)
+                        VALUES (?, ?, ?, ?)
+                    """, (rid, now, risk, msg["message"]))
+                else:
+                    cursor.execute("""
                         INSERT INTO alerts (route_id, triggered_at, risk_score, message)
                         VALUES (%s, %s, %s, %s)
                     """, (rid, now, risk, msg["message"]))
@@ -367,49 +533,56 @@ async def advance_simulation():
     }
 
 
-
 @app.get("/impact")
 async def get_impact():
     """Return impact metrics: CO2 saved, cost savings, disruptions caught."""
-    from simulate_data import ROUTES, ROUTE_CONTEXT
+    try:
+        from simulate_data import ROUTES, ROUTE_CONTEXT
+    except ImportError:
+        return {"error": "simulate_data module not available"}
 
-    # Constants for impact calculation
-    CO2_PER_KM_TRUCK = 0.9          # kg CO2 per km (avg Indian heavy truck)
-    COST_PER_KM_INR = 45            # INR per km logistics cost
-    DISRUPTION_DELAY_HOURS = 6      # avg hours lost per unmitigated disruption
-    HOURLY_CARGO_VALUE_INR = 85000  # avg cargo value per hour of delay
+    CO2_PER_KM_TRUCK = 0.9
+    COST_PER_KM_INR = 45
+    DISRUPTION_DELAY_HOURS = 6
+    HOURLY_CARGO_VALUE_INR = 85000
 
     with get_conn() as conn:
-        with conn.cursor() as cur:
-            # Total disruptions detected
-            cur.execute("SELECT COUNT(*) as cnt FROM alerts WHERE risk_score > 0.7")
-            disruptions_caught = cur.fetchone()["cnt"]
+        cursor = conn.cursor()
+        if USE_SQLITE or not POSTGRES_AVAILABLE:
+            cursor.execute("SELECT COUNT(*) as cnt FROM alerts WHERE risk_score > 0.7")
+        else:
+            cursor.execute("SELECT COUNT(*) as cnt FROM alerts WHERE risk_score > 0.7")
+        disruptions_caught = cursor.fetchone()["cnt"]
 
-            # Per route stats
-            route_stats = []
-            for route in ROUTES:
-                rid = route["route_id"]
-                ctx = ROUTE_CONTEXT.get(rid, {})
-                dist = ctx.get("distance_km", 1300)
+        route_stats = []
+        for route in ROUTES:
+            rid = route["route_id"]
+            ctx = ROUTE_CONTEXT.get(rid, {})
+            dist = ctx.get("distance_km", 1300)
 
-                # Alt route is ~15% longer on average
-                alt_dist_saved = dist * 0.15
-                co2_saved = round(alt_dist_saved * CO2_PER_KM_TRUCK, 1)
-                cost_saved = round(alt_dist_saved * COST_PER_KM_INR)
+            alt_dist_saved = dist * 0.15
+            co2_saved = round(alt_dist_saved * CO2_PER_KM_TRUCK, 1)
+            cost_saved = round(alt_dist_saved * COST_PER_KM_INR)
 
-                cur.execute(
+            if USE_SQLITE or not POSTGRES_AVAILABLE:
+                cursor.execute(
+                    "SELECT COUNT(*) as cnt FROM alerts WHERE route_id=? AND risk_score > 0.7",
+                    (rid,)
+                )
+            else:
+                cursor.execute(
                     "SELECT COUNT(*) as cnt FROM alerts WHERE route_id=%s AND risk_score > 0.7",
                     (rid,)
                 )
-                route_disruptions = cur.fetchone()["cnt"]
+            route_disruptions = cursor.fetchone()["cnt"]
 
-                route_stats.append({
-                    "route_id": rid,
-                    "name": route["name"],
-                    "disruptions_caught": route_disruptions,
-                    "co2_saved_kg": co2_saved * route_disruptions if route_disruptions else 0,
-                    "cost_saved_inr": cost_saved * route_disruptions if route_disruptions else 0,
-                })
+            route_stats.append({
+                "route_id": rid,
+                "name": route["name"],
+                "disruptions_caught": route_disruptions,
+                "co2_saved_kg": co2_saved * route_disruptions if route_disruptions else 0,
+                "cost_saved_inr": cost_saved * route_disruptions if route_disruptions else 0,
+            })
 
     total_co2 = sum(r["co2_saved_kg"] for r in route_stats)
     total_cost = sum(r["cost_saved_inr"] for r in route_stats)
@@ -420,7 +593,7 @@ async def get_impact():
         "summary": {
             "disruptions_caught": disruptions_caught,
             "co2_saved_kg": round(total_co2, 1),
-            "co2_saved_trees_equivalent": round(total_co2 / 21, 1),  # avg tree absorbs 21kg/yr
+            "co2_saved_trees_equivalent": round(total_co2 / 21, 1),
             "cost_saved_inr": total_cost,
             "delay_hours_avoided": delay_hours_avoided,
             "cargo_value_protected_inr": cargo_value_protected,
@@ -436,32 +609,42 @@ async def reset_simulation():
     global sim_hour_offset
     sim_hour_offset = 0
 
-    from simulate_data import seed_database
-
     try:
-        if DATABASE_URL and "localhost" not in DATABASE_URL:
+        from simulate_data import seed_database
+        if not USE_SQLITE:
             seed_database(DATABASE_URL)
-        else:
-            print("Skipping DB seed")
     except Exception as e:
-        print("DB startup skipped:", e)
+        print(f"Reset skipped: {e}")
 
-    return {"message": "Simulation reset complete"}
     # Re-compute risk scores
-    from simulate_data import ROUTES
-    with get_conn() as conn:
-        with conn.cursor() as cur:
+    try:
+        from simulate_data import ROUTES
+        with get_conn() as conn:
+            cursor = conn.cursor()
             for route in ROUTES:
-                cur.execute(
-                    "SELECT id, weather_severity, port_congestion_index, traffic_speed_ratio, is_holiday, hour_of_day, day_of_week FROM route_snapshots WHERE route_id = %s",
-                    (route["route_id"],)
-                )
-                rows = cur.fetchall()
+                if USE_SQLITE or not POSTGRES_AVAILABLE:
+                    cursor.execute(
+                        "SELECT id, weather_severity, port_congestion_index, traffic_speed_ratio, is_holiday, hour_of_day, day_of_week FROM route_snapshots WHERE route_id = ?",
+                        (route["route_id"],)
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT id, weather_severity, port_congestion_index, traffic_speed_ratio, is_holiday, hour_of_day, day_of_week FROM route_snapshots WHERE route_id = %s",
+                        (route["route_id"],)
+                    )
+                rows = cursor.fetchall()
                 for row in rows:
                     risk = predict_risk(dict(row))
-                    cur.execute("UPDATE route_snapshots SET risk_score = %s WHERE id = %s", (risk, row["id"]))
-        conn.commit()
+                    if USE_SQLITE or not POSTGRES_AVAILABLE:
+                        cursor.execute("UPDATE route_snapshots SET risk_score = ? WHERE id = ?", (risk, row["id"]))
+                    else:
+                        cursor.execute("UPDATE route_snapshots SET risk_score = %s WHERE id = %s", (risk, row["id"]))
+            conn.commit()
+    except Exception as e:
+        print(f"Risk recomputation failed: {e}")
+
     return {"status": "reset complete", "sim_hour": 0}
+
 
 @app.post("/simulate/trigger-disruption")
 async def trigger_disruption():
@@ -469,10 +652,11 @@ async def trigger_disruption():
     global sim_hour_offset
     sim_hour_offset = 30
 
-    from simulate_data import ROUTES
-    from datetime import timezone
+    try:
+        from simulate_data import ROUTES
+    except ImportError:
+        return {"error": "simulate_data module not available"}
 
-    # Hardcode the exact disruption values instead of relying on index math
     disruption_snaps = {
         "MUM_DEL": {
             "weather_severity": 8.5,
@@ -506,12 +690,28 @@ async def trigger_disruption():
     now = datetime.now(timezone.utc)
     inserted = []
     with get_conn() as conn:
-        with conn.cursor() as cur:
-            for route in ROUTES:
-                rid = route["route_id"]
-                snap = disruption_snaps[rid]
-                risk = predict_risk(snap)
-                cur.execute("""
+        cursor = conn.cursor()
+        for route in ROUTES:
+            rid = route["route_id"]
+            snap = disruption_snaps[rid]
+            risk = predict_risk(snap)
+            
+            if USE_SQLITE or not POSTGRES_AVAILABLE:
+                cursor.execute("""
+                    INSERT INTO route_snapshots
+                    (route_id, timestamp, weather_severity, port_congestion_index,
+                     traffic_speed_ratio, is_holiday, hour_of_day, day_of_week,
+                     risk_score, is_disruption)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    rid, now,
+                    snap["weather_severity"], snap["port_congestion_index"],
+                    snap["traffic_speed_ratio"], snap["is_holiday"],
+                    snap["hour_of_day"], snap["day_of_week"],
+                    risk, snap["is_disruption"]
+                ))
+            else:
+                cursor.execute("""
                     INSERT INTO route_snapshots
                     (route_id, timestamp, weather_severity, port_congestion_index,
                      traffic_speed_ratio, is_holiday, hour_of_day, day_of_week,
@@ -524,21 +724,29 @@ async def trigger_disruption():
                     snap["hour_of_day"], snap["day_of_week"],
                     risk, snap["is_disruption"]
                 ))
-                inserted.append({"route_id": rid, "risk_score": risk})
+            
+            inserted.append({"route_id": rid, "risk_score": risk})
 
-                if risk > 0.7:
-                    alert_text = generate_alert_message(rid, snap, risk)
-                    msg = {
-                        "type": "alert",
-                        "route_id": rid,
-                        "route_name": route["name"],
-                        "risk_score": risk,
-                        "message": alert_text,
-                        "triggered_at": now.isoformat(),
-                        "ai_generated": True,
-                    }
-                    asyncio.create_task(broadcast(msg))
-                    cur.execute("""
+            if risk > 0.7:
+                alert_text = generate_alert_message(rid, snap, risk)
+                msg = {
+                    "type": "alert",
+                    "route_id": rid,
+                    "route_name": route["name"],
+                    "risk_score": risk,
+                    "message": alert_text,
+                    "triggered_at": now.isoformat(),
+                    "ai_generated": True,
+                }
+                asyncio.create_task(broadcast(msg))
+                
+                if USE_SQLITE or not POSTGRES_AVAILABLE:
+                    cursor.execute("""
+                        INSERT INTO alerts (route_id, triggered_at, risk_score, message)
+                        VALUES (?, ?, ?, ?)
+                    """, (rid, now, risk, msg["message"]))
+                else:
+                    cursor.execute("""
                         INSERT INTO alerts (route_id, triggered_at, risk_score, message)
                         VALUES (%s, %s, %s, %s)
                     """, (rid, now, risk, msg["message"]))
@@ -547,13 +755,14 @@ async def trigger_disruption():
 
     return {"status": "disruption injected", "snapshots": inserted}
 
+
 @app.websocket("/ws/alerts")
 async def ws_alerts(websocket: WebSocket):
     await websocket.accept()
     connected_clients.append(websocket)
     try:
         while True:
-            await websocket.receive_text()  # keep alive
+            await websocket.receive_text()
     except WebSocketDisconnect:
         if websocket in connected_clients:
             connected_clients.remove(websocket)

@@ -1,10 +1,12 @@
 fastapi
-uvicorn
-pandas
+uvicorn[standard]
 numpy
-xgboost
+pandas
 scikit-learn
+xgboost
+psycopg2-binary
+python-multipart
 python-dotenv
 groq
 sqlalchemy
-psycopg2-binary
+websockets
