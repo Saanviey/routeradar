@@ -25,15 +25,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 print("STARTING MAIN.PY")
-print("DATABASE_URL =", os.getenv("DATABASE_URL"))
 
-# ─── Config ────────────────────────────────────────────────────────────────────
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:Post#adi@localhost:5432/routeradar"
-)
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+print("DATABASE_URL =", DATABASE_URL if DATABASE_URL else "NOT SET")
+
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "route_model.pkl")
-
 # ─── Alternate routes (hardcoded per spec) ─────────────────────────────────────
 ALTERNATES = {
     "MUM_DEL": [
